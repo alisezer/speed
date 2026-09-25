@@ -2,6 +2,12 @@
 name = "speed"
 version = "0.1.0"
 edition = "2024"
+description = "Internet speed test and live throughput monitor for the terminal"
+license = "MIT"
+repository = "https://github.com/alisezer/speed"
+readme = "README.md"
+keywords = ["speedtest", "bandwidth", "latency", "network", "cli"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow = "1.0.104"

@@ -46,3 +46,7 @@ Exit codes: `0` ok, `1` error, `2` bad arguments, `3` a measurement got no data.
 - **`watch`** keeps parallel downloads running from the nearest servers and samples the rate once a second. It uses a lot of data: about 3.75 GB per minute at 500 Mbps.
 
 Cloudflare rate-limits repeated uploads (HTTP 429); wait a minute between runs.
+
+## License
+
+MIT
