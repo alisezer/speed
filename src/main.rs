@@ -1,4 +1,6 @@
+mod latency;
 mod net;
+mod servers;
 mod test;
 mod ui;
 mod watch;
@@ -22,6 +24,8 @@ enum Cmd {
     Test(test::Opts),
     /// Continuous download monitor with a live chart; Ctrl+C to stop
     Watch(watch::Opts),
+    /// Rank the download mirrors by round-trip time from here
+    Servers,
 }
 
 #[tokio::main]
@@ -39,6 +43,7 @@ async fn main() {
             }
         },
         Cmd::Watch(o) => watch::run(o).await,
+        Cmd::Servers => servers::list().await,
     };
     if let Err(e) = res {
         eprint!("{}", ui::SHOW_CURSOR);

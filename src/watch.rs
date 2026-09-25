@@ -2,6 +2,7 @@
 
 use crate::{
     net::{self, Stats},
+    servers,
     test::server_line,
     ui::{self, Accent},
 };
@@ -46,9 +47,12 @@ pub async fn run(o: Opts) -> Result<()> {
     let client = net::client();
     let mut out = std::io::stdout();
 
-    let meta = net::meta(&client).await;
+    // Enough servers that none gets more than its connection cap, up to 5 for spread
+    let streams = o.streams as usize;
+    let want = streams.min(servers::TEST_SERVERS).max(streams.div_ceil(servers::CONNS_PER_SERVER));
+    let (meta, nearest) = tokio::join!(net::meta(&client), servers::nearest(&client, want));
     let server = server_line(&meta);
-    let details = [server, format!("{} streams", o.streams)]
+    let details = [server, format!("{} streams via {}", o.streams, servers::cities(&nearest))]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
@@ -59,9 +63,9 @@ pub async fn run(o: Opts) -> Result<()> {
     }
 
     let stats = Arc::new(Stats::default());
-    let tasks: Vec<_> = (0..o.streams as usize)
+    let tasks: Vec<_> = (0..streams)
         .map(|i| {
-            let url = net::WATCH_SOURCES[i % net::WATCH_SOURCES.len()].to_string();
+            let url = nearest[i % nearest.len()].server.url.to_string();
             tokio::spawn(net::download_loop(client.clone(), url, stats.clone()))
         })
         .collect();

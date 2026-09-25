@@ -1,4 +1,4 @@
-//! Transfer loops, latency probes and server metadata.
+//! Transfer loops and server metadata.
 //!
 //! Throughput is counted in-process as bytes move through our own connections,
 //! so other traffic on the machine doesn't skew the numbers.
@@ -7,35 +7,19 @@ use bytes::Bytes;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::{
-    net::SocketAddr,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::net::TcpStream;
 
 pub const CLOUDFLARE: &str = "speed.cloudflare.com";
-
-/// Hetzner speed mirrors; each allows 2 connections per IP.
-pub const HETZNER: [&str; 5] = ["ash", "hil", "nbg1", "fsn1", "hel1"];
-pub const HETZNER_CONNS: usize = 2;
-
-/// Large files on mirrors that don't rate-limit repeated downloads (for `watch`).
-pub const WATCH_SOURCES: [&str; 2] = [
-    "https://proof.ovh.net/files/1Gb.dat",
-    "http://ipv4.download.thinkbroadband.com/1GB.zip",
-];
 
 pub const UPLOAD_STREAMS: usize = 4;
 /// Cloudflare rejects larger bodies when several uploads run in parallel.
 const UPLOAD_BODY: usize = 50 * 1024 * 1024;
 const UPLOAD_CHUNK: usize = 256 * 1024;
-
-pub fn hetzner_url(mirror: &str) -> String {
-    format!("https://{mirror}-speed.hetzner.com/10GB.bin")
-}
 
 pub fn client() -> Client {
     Client::builder()
@@ -151,53 +135,6 @@ pub async fn upload_loop(client: Client, stats: Arc<Stats>) {
             stats.bytes.fetch_sub(sent.load(Ordering::Relaxed), Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
-    }
-}
-
-pub async fn resolve(host: &str) -> Option<SocketAddr> {
-    tokio::net::lookup_host((host, 443)).await.ok()?.next()
-}
-
-/// Round-trip time of a TCP handshake (SYN → SYN-ACK), no root needed unlike ICMP.
-pub async fn tcp_rtt(addr: SocketAddr) -> Option<f64> {
-    let t = Instant::now();
-    match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => Some(t.elapsed().as_secs_f64() * 1000.0),
-        _ => None,
-    }
-}
-
-pub struct Latency {
-    pub ms: f64,
-    pub jitter_ms: f64,
-}
-
-pub async fn idle_latency(addr: SocketAddr, samples: usize) -> Option<Latency> {
-    let mut rtts = Vec::with_capacity(samples);
-    for _ in 0..samples {
-        if let Some(ms) = tcp_rtt(addr).await {
-            rtts.push(ms);
-        }
-    }
-    if rtts.is_empty() {
-        return None;
-    }
-    // Jitter: mean difference between consecutive samples
-    let jitter_ms = if rtts.len() > 1 {
-        rtts.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f64>() / (rtts.len() - 1) as f64
-    } else {
-        0.0
-    };
-    Some(Latency { ms: median(&mut rtts), jitter_ms })
-}
-
-/// Probes latency every 250 ms while a transfer runs, to expose bufferbloat.
-pub async fn loaded_latency_loop(addr: SocketAddr, out: Arc<Mutex<Vec<f64>>>) {
-    loop {
-        if let Some(ms) = tcp_rtt(addr).await {
-            out.lock().unwrap().push(ms);
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 

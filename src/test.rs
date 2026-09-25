@@ -1,7 +1,9 @@
 //! `speed test`: idle latency, then download and upload for a fixed time each.
 
 use crate::{
+    latency::{self, Pinger},
     net::{self, Stats},
+    servers::{self, Ranked},
     ui::{self, Accent},
 };
 use anyhow::Result;
@@ -10,7 +12,6 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     io::{IsTerminal, Write},
-    net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -35,8 +36,17 @@ struct Report {
     location: Option<String>,
     latency_ms: Option<f64>,
     jitter_ms: Option<f64>,
+    latency_method: Option<&'static str>,
+    servers: Vec<ServerInfo>,
     download: PhaseResult,
     upload: Option<PhaseResult>,
+}
+
+#[derive(Serialize)]
+struct ServerInfo {
+    city: &'static str,
+    provider: &'static str,
+    rtt_ms: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -100,26 +110,36 @@ pub async fn run(o: Opts) -> Result<()> {
         print!("{}\n  {}  {}\n\n", ui::HIDE_CURSOR, ui::bold("speed"), ui::dim("connecting…"));
         out.flush()?;
     }
-    let (meta, addr) = tokio::join!(net::meta(&client), net::resolve(net::CLOUDFLARE));
+    let (meta, nearest) = tokio::join!(net::meta(&client), servers::nearest(&client, servers::TEST_SERVERS));
+    let pinger = Pinger::new(nearest.first().map(|r| r.server.url)).await.map(Arc::new);
     if live {
         let server = server_line(&meta);
         let mut head = format!("  {}", ui::bold("speed"));
         if !server.is_empty() {
             head += &format!("  {}", ui::dim(&server));
         }
+        let via = ui::dim(&format!("  via {}", servers::cities(&nearest)));
         // Replace the "connecting…" header (two lines up)
-        print!("\x1b[2A{}{head}\n\n", ui::CLEAR_LINE);
+        print!("\x1b[2A{}{head}\n{via}\n\n", ui::CLEAR_LINE);
         print!("{}{}", row_label("◷", "Latency", Accent::Cyan), ui::dim("measuring…"));
         out.flush()?;
     }
 
-    let idle = match addr {
-        Some(a) => net::idle_latency(a, 10).await,
+    let idle = match &pinger {
+        Some(p) => latency::idle(p, 10).await,
         None => None,
     };
     if live {
         let text = match &idle {
-            Some(l) => format!("{}   {}", ui::bold(&format!("{:>11}", ui::ms(l.ms))),ui::dim(&format!("jitter {}", ui::ms(l.jitter_ms)))),
+            Some(l) => {
+                // Flag the fallback: HTTP timing includes server processing time
+                let how = if pinger.as_ref().is_some_and(|p| p.method() == "http") { " (http)" } else { "" };
+                format!(
+                    "{}   {}",
+                    ui::bold(&format!("{:>11}", ui::ms(l.ms))),
+                    ui::dim(&format!("jitter {}{how}", ui::ms(l.jitter_ms)))
+                )
+            }
             None => ui::yellow("unavailable"),
         };
         println!("{}{}{text}", ui::CLEAR_LINE, row_label("◷", "Latency", Accent::Cyan));
@@ -127,11 +147,11 @@ pub async fn run(o: Opts) -> Result<()> {
 
     let secs = Duration::from_secs(o.duration);
     let idle_ms = idle.as_ref().map(|l| l.ms);
-    let download = phase(Dir::Down, &client, secs, addr, idle_ms, live).await?;
+    let download = phase(Dir::Down, &client, &nearest, secs, pinger.clone(), idle_ms, live).await?;
     let upload = if o.no_upload {
         None
     } else {
-        Some(phase(Dir::Up, &client, secs, addr, idle_ms, live).await?)
+        Some(phase(Dir::Up, &client, &nearest, secs, pinger.clone(), idle_ms, live).await?)
     };
 
     if live {
@@ -144,6 +164,11 @@ pub async fn run(o: Opts) -> Result<()> {
                 .filter(|s| !s.is_empty()),
             latency_ms: idle.as_ref().map(|l| round1(l.ms)),
             jitter_ms: idle.as_ref().map(|l| round1(l.jitter_ms)),
+            latency_method: pinger.as_ref().map(|p| p.method()),
+            servers: nearest
+                .iter()
+                .map(|r| ServerInfo { city: r.server.city, provider: r.server.provider, rtt_ms: r.rtt_ms.map(round1) })
+                .collect(),
             download,
             upload,
         };
@@ -161,8 +186,9 @@ fn round1(v: f64) -> f64 {
 async fn phase(
     dir: Dir,
     client: &reqwest::Client,
+    nearest: &[Ranked],
     dur: Duration,
-    lat_addr: Option<SocketAddr>,
+    pinger: Option<Arc<Pinger>>,
     idle_ms: Option<f64>,
     live: bool,
 ) -> Result<PhaseResult> {
@@ -171,9 +197,9 @@ async fn phase(
     let mut tasks = Vec::new();
     match dir {
         Dir::Down => {
-            for m in net::HETZNER {
-                for _ in 0..net::HETZNER_CONNS {
-                    tasks.push(tokio::spawn(net::download_loop(client.clone(), net::hetzner_url(m), stats.clone())));
+            for r in nearest {
+                for _ in 0..servers::CONNS_PER_SERVER {
+                    tasks.push(tokio::spawn(net::download_loop(client.clone(), r.server.url.to_string(), stats.clone())));
                 }
             }
         }
@@ -183,8 +209,8 @@ async fn phase(
             }
         }
     }
-    if let Some(a) = lat_addr {
-        tasks.push(tokio::spawn(net::loaded_latency_loop(a, loaded.clone())));
+    if let Some(p) = pinger {
+        tasks.push(tokio::spawn(latency::loaded_loop(p, loaded.clone())));
     }
 
     let accent = dir.accent();
