@@ -9,7 +9,15 @@ use clap::{Parser, Subcommand};
 
 /// Internet speed test and live throughput monitor.
 #[derive(Parser)]
-#[command(name = "speed", version, args_conflicts_with_subcommands = true)]
+#[command(
+    name = "speed",
+    version,
+    args_conflicts_with_subcommands = true,
+    after_help = "For scripts and agents: `speed test --json` prints one JSON object; \
+                  `speed watch --json -d SECS` prints JSON Lines.\n\
+                  Exit codes: 0 ok, 1 error, 2 bad arguments, 3 a measurement got no data \
+                  (see the `error` fields)."
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -50,9 +58,14 @@ async fn main() {
         Cmd::Watch(o) => watch::run(o).await,
         Cmd::Servers => servers::list().await,
     };
-    if let Err(e) = res {
-        eprint!("{}", ui::SHOW_CURSOR);
-        eprintln!("speed: {e:#}");
-        std::process::exit(1);
+    match res {
+        Ok(true) => {}
+        // The output's `error` fields say what failed
+        Ok(false) => std::process::exit(3),
+        Err(e) => {
+            eprint!("{}", ui::SHOW_CURSOR);
+            eprintln!("speed: {e:#}");
+            std::process::exit(1);
+        }
     }
 }

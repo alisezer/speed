@@ -175,7 +175,8 @@ pub fn cities(servers: &[Ranked]) -> String {
 
 /// `speed servers`: every mirror ranked by round trip, with the nearest checked
 /// and the ones `speed test` would use marked.
-pub async fn list() -> anyhow::Result<()> {
+/// Returns whether any server was reachable.
+pub async fn list() -> anyhow::Result<bool> {
     use crate::ui::{self, Accent};
     let client = crate::net::client();
     let (ranked, method) = rank(&client).await;
@@ -199,5 +200,5 @@ pub async fn list() -> anyhow::Result<()> {
         };
         println!("  {mark} {rtt}   {:<13} {:<15} {}{note}", r.server.city, r.server.provider, ui::dim(host(r.server.url)));
     }
-    Ok(())
+    Ok(reachable > 0)
 }

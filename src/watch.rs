@@ -8,6 +8,8 @@ use crate::{
 };
 use anyhow::Result;
 use clap::Parser;
+use serde::Serialize;
+use serde_json::json;
 use std::{
     io::{IsTerminal, Write},
     sync::Arc,
@@ -19,9 +21,42 @@ pub struct Opts {
     /// Parallel download streams
     #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u64).range(1..=32))]
     pub streams: u64,
-    /// Stop after this many seconds instead of running until Ctrl+C
+    /// Stop after this many seconds instead of running until Ctrl+C or SIGTERM
     #[arg(short, long)]
     pub duration: Option<u64>,
+    /// Print JSON Lines: a "start" object, a "sample" each second, then a "summary"
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Serialize)]
+struct ServerInfo {
+    city: &'static str,
+    provider: &'static str,
+    rtt_ms: Option<f64>,
+}
+
+/// Resolves on Ctrl+C or SIGTERM, so `timeout 30 speed watch` still prints a summary.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            },
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
 }
 
 const CHART_HEIGHT: usize = 6;
@@ -42,8 +77,9 @@ impl Tally {
     }
 }
 
-pub async fn run(o: Opts) -> Result<()> {
-    let live = std::io::stdout().is_terminal();
+/// Returns whether any data got through.
+pub async fn run(o: Opts) -> Result<bool> {
+    let live = std::io::stdout().is_terminal() && !o.json;
     let client = net::client();
     let mut out = std::io::stdout();
 
@@ -57,7 +93,22 @@ pub async fn run(o: Opts) -> Result<()> {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" · ");
-    println!("  {}  {}\n", ui::bold("speed watch"), ui::dim(&details));
+    let servers: Vec<ServerInfo> = nearest
+        .iter()
+        .map(|r| ServerInfo { city: r.server.city, provider: r.server.provider, rtt_ms: r.rtt_ms.map(round1) })
+        .collect();
+    if o.json {
+        let start = json!({
+            "type": "start",
+            "isp": meta.as_organization,
+            "streams": o.streams,
+            "duration": o.duration,
+            "servers": servers,
+        });
+        println!("{start}");
+    } else {
+        println!("  {}  {}\n", ui::bold("speed watch"), ui::dim(&details));
+    }
     if live {
         print!("{}", ui::HIDE_CURSOR);
     }
@@ -73,8 +124,8 @@ pub async fn run(o: Opts) -> Result<()> {
     let start = Instant::now();
     let stop_at = o.duration.map(|d| start + Duration::from_secs(d));
     let mut tick = tokio::time::interval_at((start + Duration::from_secs(1)).into(), Duration::from_secs(1));
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    let stop = stop_signal();
+    tokio::pin!(stop);
     let (mut prev_t, mut prev_b) = (start, 0u64);
     let mut tally = Tally { history: Vec::new(), min: f64::INFINITY, max: 0.0 };
     let mut drawn = 0;
@@ -82,7 +133,7 @@ pub async fn run(o: Opts) -> Result<()> {
     loop {
         tokio::select! {
             _ = tick.tick() => {}
-            _ = &mut ctrl_c => break,
+            _ = &mut stop => break,
         }
         let (now, b) = (Instant::now(), stats.bytes());
         // Divide by the real elapsed time, not a nominal 1s
@@ -96,11 +147,25 @@ pub async fn run(o: Opts) -> Result<()> {
         let elapsed = now - start;
         let avg = tally.avg();
 
-        if live {
+        let settled = tally.history.len() > WARMUP;
+        if o.json {
+            // avg/min/max are null until the warm-up seconds have passed
+            let sample = json!({
+                "type": "sample",
+                "t": tally.history.len(),
+                "mbps": round1(mbps),
+                "avg_mbps": settled.then(|| round1(avg)),
+                "min_mbps": settled.then(|| round1(tally.min)),
+                "max_mbps": settled.then(|| round1(tally.max)),
+                "bytes": b,
+                "error": if mbps < 0.1 { stats.last_error() } else { None },
+            });
+            println!("{sample}");
+        } else if live {
             drawn = draw(&tally, mbps, avg, elapsed, b, stats.last_error(), drawn)?;
         } else {
             let mut line = format!("{:>5}s  {mbps:>7.1} Mbps", tally.history.len());
-            if tally.history.len() > WARMUP {
+            if settled {
                 line += &format!("  avg {avg:.1}  min {:.1}  max {:.1}", tally.min, tally.max);
             }
             println!("{line}");
@@ -122,9 +187,27 @@ pub async fn run(o: Opts) -> Result<()> {
             print!("\x1b[2A\x1b[J");
         }
     }
+    // Under 1 MB means nothing meaningful got through
+    let ok = b >= 1_000_000;
+    let error = (!ok).then(|| stats.last_error().unwrap_or_else(|| "no data transferred".into()));
+    if o.json {
+        let settled = tally.history.len() > WARMUP;
+        let summary = json!({
+            "type": "summary",
+            "seconds": (elapsed.as_secs_f64() * 100.0).round() / 100.0,
+            "avg_mbps": (!tally.history.is_empty()).then(|| round1(tally.avg())),
+            "min_mbps": settled.then(|| round1(tally.min)),
+            "max_mbps": settled.then(|| round1(tally.max)),
+            "bytes": b,
+            "servers": servers,
+            "error": error,
+        });
+        println!("{summary}");
+        return Ok(ok);
+    }
     if tally.history.is_empty() {
         println!();
-        return Ok(());
+        return Ok(ok);
     }
     let avg = tally.avg();
     let line = format!(
@@ -135,8 +218,11 @@ pub async fn run(o: Opts) -> Result<()> {
         ui::dim(&format!("{} downloaded", ui::bytes(b))),
     );
     println!("\n{line}");
+    if let Some(e) = &error {
+        println!("  {}", ui::red(&format!("failed · {e}")));
+    }
     out.flush()?;
-    Ok(())
+    Ok(ok)
 }
 
 fn finite(v: f64) -> f64 {

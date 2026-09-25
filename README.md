@@ -28,6 +28,16 @@ speed watch -s 8 -d 60 # 8 streams, stop after 60s
 speed servers          # rank the download mirrors from where you are
 ```
 
+## For scripts and agents
+
+```
+speed test --json -d 5        # one JSON object (also the default when stdout isn't a terminal)
+speed watch --json -d 30      # JSON Lines: {"type":"start"}, {"type":"sample"} per second, {"type":"summary"}
+timeout 30 speed watch --json # SIGTERM or Ctrl+C also ends with a summary line
+```
+
+Exit codes: `0` ok, `1` error, `2` bad arguments, `3` a measurement got no data. On `3`, the `error` fields say why (e.g. `rate limited (HTTP 429), wait a minute`). `speed watch --json` without `-d` runs until stopped.
+
 ## How it measures
 
 - **Throughput** is counted in-process on its own connections, so other traffic on the machine doesn't skew it. The final rate skips the first 1–2 seconds of ramp-up.

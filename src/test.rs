@@ -101,7 +101,8 @@ fn row_label(icon: &str, label: &str, accent: Accent) -> String {
     format!("  {} {}", accent.paint(icon), ui::bold(&format!("{label:<9}")))
 }
 
-pub async fn run(o: Opts) -> Result<()> {
+/// Returns whether every phase got data through.
+pub async fn run(o: Opts) -> Result<bool> {
     let live = std::io::stdout().is_terminal() && !o.json;
     let client = net::client();
     let mut out = std::io::stdout();
@@ -154,6 +155,7 @@ pub async fn run(o: Opts) -> Result<()> {
         Some(phase(Dir::Up, &client, &nearest, secs, pinger.clone(), idle_ms, live).await?)
     };
 
+    let ok = download.error.is_none() && upload.as_ref().is_none_or(|u| u.error.is_none());
     if live {
         print!("\n{}", ui::SHOW_CURSOR);
     } else {
@@ -175,7 +177,7 @@ pub async fn run(o: Opts) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
     out.flush()?;
-    Ok(())
+    Ok(ok)
 }
 
 fn round1(v: f64) -> f64 {
