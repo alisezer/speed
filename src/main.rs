@@ -30,6 +30,11 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() {
+    // Exit quietly when piped into something like `head` instead of panicking
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     ui::init_color();
     let cli = Cli::parse();
     let cmd = cli.cmd.unwrap_or(Cmd::Test(cli.test));

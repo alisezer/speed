@@ -1,5 +1,6 @@
-//! Round-trip latency: ICMP echo to Cloudflare's nearest edge when the OS allows
-//! it unprivileged (macOS, most Linux), otherwise timed HTTP requests on a warm
+//! Round-trip latency via ICMP echo to Cloudflare's nearest edge: an unprivileged
+//! ICMP socket where the OS allows one (macOS, many Linux setups), else the system
+//! `ping` binary (which has the privileges), else timed HTTP requests on a warm
 //! connection to the nearest download server.
 
 use crate::{net, servers};
@@ -20,6 +21,7 @@ static SEQ: AtomicU16 = AtomicU16::new(0);
 
 pub enum Pinger {
     Icmp(Ipv4Addr),
+    SystemPing(Ipv4Addr),
     Http { client: Client, url: String },
 }
 
@@ -27,9 +29,10 @@ impl Pinger {
     /// ICMP if an echo gets through, else HTTP to `fallback_url`, else nothing.
     pub async fn new(fallback_url: Option<&str>) -> Option<Pinger> {
         if let Some(addr) = resolve_v4(net::CLOUDFLARE).await {
-            let p = Pinger::Icmp(addr);
-            if p.rtt().await.is_some() {
-                return Some(p);
+            for p in [Pinger::Icmp(addr), Pinger::SystemPing(addr)] {
+                if p.rtt().await.is_some() {
+                    return Some(p);
+                }
             }
         }
         let url = fallback_url?.to_string();
@@ -42,7 +45,7 @@ impl Pinger {
 
     pub fn method(&self) -> &'static str {
         match self {
-            Pinger::Icmp(_) => "icmp",
+            Pinger::Icmp(_) | Pinger::SystemPing(_) => "icmp",
             Pinger::Http { .. } => "http",
         }
     }
@@ -50,6 +53,7 @@ impl Pinger {
     pub async fn rtt(&self) -> Option<f64> {
         match self {
             Pinger::Icmp(addr) => icmp_rtt(*addr).await,
+            Pinger::SystemPing(addr) => system_ping(*addr, 1).await,
             Pinger::Http { client, url } => {
                 tokio::time::timeout(Duration::from_secs(3), servers::timed_get(client, url)).await.ok().flatten()
             }
@@ -58,12 +62,12 @@ impl Pinger {
 }
 
 /// Reserves a block of sequence numbers so concurrent pings never collide.
-pub fn next_seqs(n: usize) -> u16 {
+fn next_seqs(n: usize) -> u16 {
     SEQ.fetch_add(n as u16, Ordering::Relaxed)
 }
 
 /// One ICMP echo round trip in milliseconds; `None` if not permitted or no reply.
-pub async fn icmp_rtt(addr: Ipv4Addr) -> Option<f64> {
+async fn icmp_rtt(addr: Ipv4Addr) -> Option<f64> {
     let seq = next_seqs(1);
     tokio::task::spawn_blocking(move || icmp_echo(addr, seq, Duration::from_millis(1500)))
         .await
@@ -78,19 +82,45 @@ pub async fn resolve_v4(host: &str) -> Option<Ipv4Addr> {
     })
 }
 
+/// Best of two echoes to each address, using whichever ICMP route works here.
+pub async fn ping_many(addrs: Vec<Ipv4Addr>) -> Vec<Option<f64>> {
+    let first_seq = next_seqs(addrs.len() * 2);
+    let batch = {
+        let addrs = addrs.clone();
+        tokio::task::spawn_blocking(move || icmp_batch(&addrs, first_seq, 2, Duration::from_millis(1500)))
+    };
+    match batch.await {
+        Ok(Some(rtts)) => rtts,
+        // No unprivileged ICMP socket: one `ping` process per address
+        _ => futures_util::future::join_all(addrs.iter().map(|&a| system_ping(a, 2))).await,
+    }
+}
+
+/// Best round trip from the system `ping` binary; `None` if it's missing or gets no reply.
+async fn system_ping(addr: Ipv4Addr, count: u32) -> Option<f64> {
+    let mut cmd = tokio::process::Command::new("ping");
+    cmd.args(["-c", &count.to_string(), "-i", "0.2", &addr.to_string()]).kill_on_drop(true);
+    let out = tokio::time::timeout(Duration::from_secs(3), cmd.output()).await.ok()?.ok()?;
+    // Both macOS and Linux print "... time=12.3 ms" per reply
+    String::from_utf8_lossy(&out.stdout)
+        .split("time=")
+        .skip(1)
+        .filter_map(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .min_by(f64::total_cmp)
+}
+
 /// One ICMP echo over an unprivileged datagram socket; `None` if not permitted or no reply.
 fn icmp_echo(addr: Ipv4Addr, seq: u16, timeout: Duration) -> Option<f64> {
-    icmp_batch(&[addr], seq, 1, timeout).into_iter().next().flatten()
+    icmp_batch(&[addr], seq, 1, timeout)?.into_iter().next().flatten()
 }
 
 /// Pings every address `rounds` times from a single socket and returns the best
-/// round trip for each. One socket matters: with many concurrent ICMP sockets,
-/// macOS delivers some replies to the wrong one and they're lost.
-pub fn icmp_batch(addrs: &[Ipv4Addr], first_seq: u16, rounds: usize, timeout: Duration) -> Vec<Option<f64>> {
+/// round trip for each, or `None` if the OS doesn't allow unprivileged ICMP sockets
+/// (Linux with `net.ipv4.ping_group_range` excluding us). One socket matters: with
+/// many concurrent ICMP sockets, macOS delivers some replies to the wrong one.
+fn icmp_batch(addrs: &[Ipv4Addr], first_seq: u16, rounds: usize, timeout: Duration) -> Option<Vec<Option<f64>>> {
     let mut best = vec![None; addrs.len()];
-    let Ok(mut sock) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) else {
-        return best;
-    };
+    let mut sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)).ok()?;
     // seq -> (address index, send time)
     let mut sent = std::collections::HashMap::new();
     for round in 0..rounds {
@@ -124,7 +154,7 @@ pub fn icmp_batch(addrs: &[Ipv4Addr], first_seq: u16, rounds: usize, timeout: Du
             best[i] = Some(best[i].map_or(ms, |b: f64| b.min(ms)));
         }
     }
-    best
+    Some(best)
 }
 
 fn echo_request(seq: u16) -> [u8; 16] {
